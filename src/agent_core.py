@@ -31,11 +31,9 @@ class Critique:
 
 
 class Agent:
-    load_dotenv()
-
     """Core agent with ReAct-style reasoning loop"""
     
-    def __init__(self, api_key: str = os.getenv("API_KEY"), model: str = "claude-sonnet-4-20250514", max_iterations: int = 10):
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", max_iterations: int = 10):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.max_iterations = max_iterations
@@ -152,6 +150,7 @@ class Agent:
             tool_input = json.loads(input_match.group(1).strip())
 
             observation = self._execute_tool(tool_name, tool_input)
+            print(f"TOOL EXECUTED: {tool_name}({tool_input})")
             return ExecutionResult(
                 action=tool_name,
                 action_input=tool_input,
@@ -172,7 +171,8 @@ class Agent:
             return f"Error: Tool '{name}' not registered."
 
         try:
-            return str(self.tools[name]["function"](**params))
+            result = str(self.tools[name]["function"](**params))
+            return f"[Tool: {name}] {result}"
         except Exception as e:
             return f"Tool execution error: {e}"
 
@@ -224,7 +224,7 @@ class Agent:
         plan = self.planner(query)
 
         if verbose:
-            print("\n📋 PLAN")
+            print("\n>>> PLAN")
             print(plan)
 
         for iteration in range(self.max_iterations):
@@ -237,13 +237,13 @@ class Agent:
             execution = self.executor(plan.next_step)
 
             if verbose:
-                print("\n🔍 OBSERVATION")
+                print("\n>>> OBSERVATION")
                 print(execution.observation[:500])
 
             critique = self.critic(plan.objective, execution.observation)
 
             if verbose:
-                print("\n🧠 CRITIQUE")
+                print("\n>>> CRITIQUE")
                 print(critique)
 
             if critique.complete:
