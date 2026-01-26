@@ -1,5 +1,3 @@
-# agent_core.py
-
 import anthropic
 import json
 import re
