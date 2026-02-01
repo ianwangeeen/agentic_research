@@ -31,7 +31,7 @@ class Critique:
 class Agent:
     """Core agent with ReAct-style reasoning loop"""
     
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", max_iterations: int = 10):
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", max_iterations: int = 3):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.max_iterations = max_iterations
@@ -88,10 +88,29 @@ class Agent:
 
         text = response.content[0].text
 
-        objective = re.search(r"objective:\s*(.*)", text).group(1)
-        steps_block = re.search(r"steps:(.*?)next_step:", text, re.DOTALL).group(1)
+        # Extract content within <plan> tags first
+        plan_match = re.search(r"<plan>(.*?)</plan>", text, re.DOTALL)
+        if plan_match:
+            text = plan_match.group(1)
+
+        # Parse with error handling
+        objective_match = re.search(r"objective:\s*(.*)", text, re.IGNORECASE)
+        steps_match = re.search(r"steps:(.*?)next_step:", text, re.DOTALL | re.IGNORECASE)
+        next_step_match = re.search(r"next_step:\s*(.*)", text, re.IGNORECASE)
+
+        if not objective_match:
+            raise RuntimeError(f"Planner response missing 'objective:' field. Raw response:\n{response.content[0].text}")
+
+        if not steps_match:
+            raise RuntimeError(f"Planner response missing 'steps:' field. Raw response:\n{response.content[0].text}")
+
+        if not next_step_match:
+            raise RuntimeError(f"Planner response missing 'next_step:' field. Raw response:\n{response.content[0].text}")
+
+        objective = objective_match.group(1).strip()
+        steps_block = steps_match.group(1)
         steps = [s.strip("- ").strip() for s in steps_block.splitlines() if s.strip()]
-        next_step = re.search(r"next_step:\s*(.*)", text).group(1)
+        next_step = next_step_match.group(1).strip()
 
         return Plan(objective=objective, steps=steps, next_step=next_step)
 
@@ -175,26 +194,27 @@ class Agent:
             return f"Tool execution error: {e}"
 
     def _critic_prompt(self) -> str:
-        return """
-            You are a critic agent.
+        return """You are a critic agent that ONLY evaluates progress. You do NOT solve tasks.
 
-            Your role:
-            - Objectively evaluate progress
-            - Decide if the task is complete
-            - If not complete, suggest the next step
+Your role:
+- Judge whether the objective has been sufficiently achieved based on the observation
+- If the observation contains a reasonable answer or useful information, mark as complete
+- If more critical information is clearly needed, suggest ONE specific next step
 
-            Rules:
-            - Be strict
-            - Prefer correctness over optimism
+Rules:
+- NEVER answer or solve the user's question yourself
+- NEVER provide analysis or explanations outside the format
+- ONLY output the critique block, nothing else
+- Be pragmatic: if the observation addresses the main question, mark complete=true
+- Don't be overly perfectionist - "good enough" is complete
 
-            Output format:
+You MUST respond with ONLY this exact format (no other text):
 
-            <critique>
-            complete: true/false
-            reason: ...
-            next_step: ...
-            </critique>
-            """
+<critique>
+complete: [true or false]
+reason: [one sentence explaining why complete or not]
+next_step: [specific action if incomplete, or "none" if complete]
+</critique>"""
     
     def critic(self, objective: str, observation: str) -> Critique:
         response = self.client.messages.create(
@@ -206,20 +226,50 @@ class Agent:
             ],
         )
 
-        text = response.content[0].text
+        # Debug: inspect full response structure
+        print(f"    DEBUG - stop_reason: {response.stop_reason}")
+        print(f"    DEBUG - content length: {len(response.content)}")
+        print(f"    DEBUG - content[0] type: {type(response.content[0])}")
+        print(f"    DEBUG - content[0]: {response.content[0]}")
 
-        complete = "true" in re.search(r"complete:\s*(.*)", text).group(1).lower()
-        reason = re.search(r"reason:\s*(.*)", text).group(1)
-        next_step_match = re.search(r"next_step:\s*(.*)", text)
+        text = response.content[0].text
+        print(f"    text: {text} \n================================\n")
+
+        # Extract content within <critique> tags first
+        critique_match = re.search(r"<critique>(.*?)</critique>", text, re.DOTALL)
+        if critique_match:
+            text = critique_match.group(1)
+
+        # Parse with error handling
+        complete_match = re.search(r"complete:\s*(.*)", text, re.IGNORECASE)
+        reason_match = re.search(r"reason:\s*(.*)", text, re.IGNORECASE)
+        next_step_match = re.search(r"next_step:\s*(.*)", text, re.IGNORECASE)
+
+        if not complete_match:
+            raise RuntimeError(f"Critic response missing 'complete:' field. Raw response:\n{response.content[0].text}")
+
+        if not reason_match:
+            raise RuntimeError(f"Critic response missing 'reason:' field. Raw response:\n{response.content[0].text}")
+
+        complete = "true" in complete_match.group(1).lower()
+        reason = reason_match.group(1).strip()
+
+        # Parse next_step, treating "none" or empty as None
+        next_step = None
+        if next_step_match:
+            next_step_raw = next_step_match.group(1).strip().lower()
+            if next_step_raw and next_step_raw != "none":
+                next_step = next_step_match.group(1).strip()
 
         return Critique(
             complete=complete,
             reason=reason,
-            next_step=next_step_match.group(1) if next_step_match else None,
+            next_step=next_step,
         )
 
     def run(self, query: str, verbose: bool = True) -> str:
         plan = self.planner(query)
+        last_observation = ""
 
         if verbose:
             print("\n>>> PLAN")
@@ -228,11 +278,12 @@ class Agent:
         for iteration in range(self.max_iterations):
             if verbose:
                 print(f"\n{'='*60}")
-                print(f"ITERATION {iteration + 1}")
+                print(f"ITERATION {iteration + 1}/{self.max_iterations}")
                 print(f"{'='*60}")
                 print(f"▶ Executing: {plan.next_step}")
 
             execution = self.executor(plan.next_step)
+            last_observation = execution.observation
 
             if verbose:
                 print("\n>>> OBSERVATION")
@@ -249,9 +300,17 @@ class Agent:
                     print("\n✅ TASK COMPLETE")
                 return execution.observation
 
+            # On last iteration, return what we have instead of continuing
+            if iteration == self.max_iterations - 1:
+                if verbose:
+                    print("\n⚠️ MAX ITERATIONS REACHED - returning best result")
+                return last_observation
+
             if not critique.next_step:
-                raise RuntimeError("Critic did not provide next step")
+                if verbose:
+                    print("\n⚠️ No next step provided - returning current result")
+                return last_observation
 
             plan.next_step = critique.next_step
 
-        raise RuntimeError("Maximum iterations reached without completion")
+        return last_observation
